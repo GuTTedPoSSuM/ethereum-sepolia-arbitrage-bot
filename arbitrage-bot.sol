@@ -38,7 +38,7 @@ contract ArbitrageBot is ReentrancyGuard {
     }
 
     modifier onlyOwner() {
-        require(msg.sender == owner, "Not the contract owner");
+        require(msg.sender == owner, "Only contract owner can call this function");
         _;
     }
 
@@ -51,7 +51,7 @@ contract ArbitrageBot is ReentrancyGuard {
         uint256 amountOutMinimum
     ) external onlyOwner {
         if (!isArbitrageProfitable(asset, amount, tokenIn, tokenOut, fee, amountOutMinimum)) {
-            revert("Arbitrage not profitable");
+            revert("Arbitrage opportunity not profitable enough");
         }
         
         executeFlashLoan(asset, amount);
@@ -66,13 +66,23 @@ contract ArbitrageBot is ReentrancyGuard {
         uint24 fee,
         uint256 amountOutMinimum
     ) internal view returns (bool) {
-        // TODO: Implement real profitability check
-        uint256 expectedOut = amount * getTokenPrice(tokenIn) / getTokenPrice(tokenOut);
-        return expectedOut > amountOutMinimum;
+        uint256 priceIn = getTokenPrice(tokenIn);
+        uint256 priceOut = getTokenPrice(tokenOut);
+        
+        if (priceIn == 0 || priceOut == 0) {
+            revert("Token price feed unavailable");
+        }
+
+        uint256 expectedOut = amount * priceIn / priceOut;
+        uint256 transactionCost = estimateTransactionCost(amount, fee, priceIn, priceOut); // Simplified cost estimation
+        return expectedOut > (amountOutMinimum + transactionCost);
     }
 
     function getTokenPrice(address token) internal view returns (uint256) {
         (, int256 price, , , ) = priceFeed.latestRoundData();
+        if (price <= 0) {
+            revert("Invalid price data from oracle");
+        }
         return uint256(price);
     }
 
@@ -89,8 +99,11 @@ contract ArbitrageBot is ReentrancyGuard {
         bytes memory params = "";
         uint16 referralCode = 0;
 
-        pool.flashLoanSimple(receiverAddress, asset, amount, params, referralCode);
-        emit FlashLoanInitiated(asset, amount);
+        try pool.flashLoanSimple(receiverAddress, asset, amount, params, referralCode) {
+            emit FlashLoanInitiated(asset, amount);
+        } catch {
+            revert("Flash loan failed");
+        }
     }
 
     function executeTrade(
@@ -114,17 +127,21 @@ contract ArbitrageBot is ReentrancyGuard {
         uint256 amountOutExpected = amountIn * getTokenPrice(tokenIn) / getTokenPrice(tokenOut);
         uint256 slippage = ((amountOutExpected - amountOutMinimum) * 10000) / amountOutExpected;
         
-        require(slippage <= maxSlippage, "Slippage exceeds maximum");
+        if (slippage > maxSlippage) {
+            revert("Slippage exceeds maximum allowed");
+        }
 
-        // Transfer tokens to this contract if they aren't already here
-        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
-        IERC20(tokenIn).approve(address(uniswapRouter), amountIn);
-        uint256 amountOut = uniswapRouter.exactInputSingle(params);
-        
-        emit TradeExecuted(tokenIn, tokenOut, amountIn, amountOut);
+        try IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn) {
+            IERC20(tokenIn).approve(address(uniswapRouter), amountIn);
+            uint256 amountOut = uniswapRouter.exactInputSingle(params);
+            
+            emit TradeExecuted(tokenIn, tokenOut, amountIn, amountOut);
 
-        // Simplified profit calculation
-        profit = amountOut - amountIn;  
+            // Simplified profit calculation
+            profit = amountOut - amountIn;  
+        } catch {
+            revert("Token transfer or swap failed");
+        }
     }
 
     function flashLoanCallback(
@@ -140,14 +157,22 @@ contract ArbitrageBot is ReentrancyGuard {
 
         // Repay the flash loan
         uint256 totalToRepay = amount + premium;
-        IERC20(asset).approve(address(pool), totalToRepay);
-        pool.flashLoanSimple(address(this), asset, totalToRepay, params, 0);
-
-        emit FlashLoanRepaid(asset, totalToRepay);
+        try IERC20(asset).approve(address(pool), totalToRepay) {
+            pool.flashLoanSimple(address(this), asset, totalToRepay, params, 0);
+            emit FlashLoanRepaid(asset, totalToRepay);
+        } catch {
+            revert("Failed to approve or repay flash loan");
+        }
     }
 
     // Function to update max slippage
     function setMaxSlippage(uint256 _maxSlippage) external onlyOwner {
         maxSlippage = _maxSlippage;
+    }
+
+    // Estimates transaction cost (this is a very simplified version)
+    function estimateTransactionCost(uint256 amount, uint24 fee, uint256 priceIn, uint256 priceOut) internal pure returns (uint256) {
+        // Here we use a very basic estimation: 1% of the amount traded as cost
+        return (amount * priceIn / priceOut) / 100;
     }
 }
