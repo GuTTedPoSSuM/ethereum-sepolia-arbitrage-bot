@@ -16,10 +16,12 @@ contract ArbitrageBot is ReentrancyGuard {
     AggregatorV3Interface public priceFeed;
     address public anotherTokenAddress;
     uint256 public maxSlippage;
+    mapping(string => uint256) public errorCounts; // For tracking errors
 
     event FlashLoanInitiated(address indexed asset, uint256 amount);
     event TradeExecuted(address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 amountOut);
     event FlashLoanRepaid(address indexed asset, uint256 amount);
+    event ErrorLogged(string errorType, uint256 count);
 
     constructor(
         address _uniswapRouter,
@@ -65,25 +67,34 @@ contract ArbitrageBot is ReentrancyGuard {
         address tokenOut,
         uint24 fee,
         uint256 amountOutMinimum
-    ) internal view returns (bool) {
-        uint256 priceIn = getTokenPrice(tokenIn);
-        uint256 priceOut = getTokenPrice(tokenOut);
-        
-        if (priceIn == 0 || priceOut == 0) {
+    ) public returns (bool) {
+        if (!isPriceFeedAvailable(tokenIn) || !isPriceFeedAvailable(tokenOut)) {
             revert("Token price feed unavailable");
         }
 
+        uint256 priceIn = getTokenPrice(tokenIn);
+        uint256 priceOut = getTokenPrice(tokenOut);
+        
         uint256 expectedOut = amount * priceIn / priceOut;
-        uint256 transactionCost = estimateTransactionCost(amount, fee, priceIn, priceOut); // Simplified cost estimation
+        uint256 transactionCost = estimateTransactionCost(amount, fee, priceIn, priceOut);
         return expectedOut > (amountOutMinimum + transactionCost);
     }
 
-    function getTokenPrice(address token) internal view returns (uint256) {
+    function getTokenPrice(address token) public returns (uint256) {
         (, int256 price, , , ) = priceFeed.latestRoundData();
         if (price <= 0) {
             revert("Invalid price data from oracle");
         }
         return uint256(price);
+    }
+
+    function isPriceFeedAvailable(address asset) internal returns (bool) {
+        uint256 price = getTokenPrice(asset);
+        if (price == 0) {
+            logError("InvalidPriceData");
+            return false;
+        }
+        return true;
     }
 
     function executeFlashLoan(
@@ -102,6 +113,7 @@ contract ArbitrageBot is ReentrancyGuard {
         try pool.flashLoanSimple(receiverAddress, asset, amount, params, referralCode) {
             emit FlashLoanInitiated(asset, amount);
         } catch {
+            logError("FlashLoanFailed");
             revert("Flash loan failed");
         }
     }
@@ -128,6 +140,7 @@ contract ArbitrageBot is ReentrancyGuard {
         uint256 slippage = ((amountOutExpected - amountOutMinimum) * 10000) / amountOutExpected;
         
         if (slippage > maxSlippage) {
+            logError("SlippageExceeded");
             revert("Slippage exceeds maximum allowed");
         }
 
@@ -140,6 +153,7 @@ contract ArbitrageBot is ReentrancyGuard {
             // Simplified profit calculation
             profit = amountOut - amountIn;  
         } catch {
+            logError("TokenTransferOrSwapFailed");
             revert("Token transfer or swap failed");
         }
     }
@@ -161,6 +175,7 @@ contract ArbitrageBot is ReentrancyGuard {
             pool.flashLoanSimple(address(this), asset, totalToRepay, params, 0);
             emit FlashLoanRepaid(asset, totalToRepay);
         } catch {
+            logError("FlashLoanRepaymentFailed");
             revert("Failed to approve or repay flash loan");
         }
     }
@@ -170,9 +185,22 @@ contract ArbitrageBot is ReentrancyGuard {
         maxSlippage = _maxSlippage;
     }
 
-    // Estimates transaction cost (this is a very simplified version)
-    function estimateTransactionCost(uint256 amount, uint24 fee, uint256 priceIn, uint256 priceOut) internal pure returns (uint256) {
-        // Here we use a very basic estimation: 1% of the amount traded as cost
-        return (amount * priceIn / priceOut) / 100;
+    // More accurate transaction cost estimation
+    function estimateTransactionCost(uint256 amount, uint24 fee, uint256 priceIn, uint256 priceOut) internal view returns (uint256) {
+        // This is still a simplified estimation:
+        // - Gas cost for transactions (in ETH) converted to token value
+        uint256 gasCostInWei = 200000 * tx.gasprice; // Assuming 200,000 gas is used for the transaction
+        uint256 gasCostInToken = gasCostInWei * priceIn / 1e18; // Convert to token amount
+
+        // Uniswap fee (0.3% for most pools, adjust based on fee tier)
+        uint256 uniswapFee = amount * fee / 1e6; // fee is in basis points
+
+        // Combine all costs
+        return gasCostInToken + uniswapFee;
+    }
+
+    function logError(string memory errorType) internal {
+        errorCounts[errorType] += 1;
+        emit ErrorLogged(errorType, errorCounts[errorType]);
     }
 }
